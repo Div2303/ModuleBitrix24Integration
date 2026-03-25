@@ -690,6 +690,50 @@ class Bitrix24Integration extends PbxExtensionBase
         return $this->query($url, $params);
     }
 
+    /**
+     * Поиск сущности (контакт/лид) по номеру телефона через REST.
+     * Возвращает ['type' => 'CONTACT', 'id' => 123, 'assigned_by_id' => 456]
+     * или пустой массив, если не найдено. Результат кэшируется на 60 секунд.
+     */
+    public function searchEntitiesByPhone(string $phone): array
+    {
+        $phoneIndex = self::getPhoneIndex($phone);
+        $cacheKey = 'search_entity_' . $phoneIndex;
+        $cached = $this->getCache($cacheKey);
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $cmd = [
+            'contact_search' => 'crm.contact.list?filter[PHONE]=' . urlencode($phoneIndex) . '&select[0]=ID&select[1]=ASSIGNED_BY_ID&start=-1',
+            'lead_search'    => 'crm.lead.list?filter[PHONE]=' . urlencode($phoneIndex) . '&select[0]=ID&select[1]=ASSIGNED_BY_ID&start=-1',
+        ];
+        $result = $this->sendBatch($cmd);
+        $contacts = $result['result']['result']['contact_search'] ?? [];
+        if (!empty($contacts)) {
+            $data = [
+                'type' => 'CONTACT',
+                'id' => $contacts[0]['ID'],
+                'assigned_by_id' => $contacts[0]['ASSIGNED_BY_ID'] ?? ''
+            ];
+            $this->saveCache($cacheKey, $data, 60);
+            return $data;
+        }
+        $leads = $result['result']['result']['lead_search'] ?? [];
+        if (!empty($leads)) {
+            $data = [
+                'type' => 'LEAD',
+                'id' => $leads[0]['ID'],
+                'assigned_by_id' => $leads[0]['ASSIGNED_BY_ID'] ?? ''
+            ];
+            $this->saveCache($cacheKey, $data, 60);
+            return $data;
+        }
+        // Сохраняем пустой результат, чтобы не повторять запросы для номера, который не найден
+        $this->saveCache($cacheKey, [], 60);
+        return [];
+    }
+
     public function getCompanyContacts($id): array
     {
         $paramsCallBack = [
@@ -1609,6 +1653,7 @@ class Bitrix24Integration extends PbxExtensionBase
             return [];
         }
         $data['uploadUrl'] = $uploadUrl;
+        $data['attempts'] = 0;   // добавили счётчик попыток
         return $data;
     }
 

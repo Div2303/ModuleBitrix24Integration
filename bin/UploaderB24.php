@@ -1,21 +1,4 @@
 <?php
-/*
- * MikoPBX - free phone system for small business
- * Copyright © 2017-2022 Alexey Portnov and Nikolay Beketov
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with this program.
- * If not, see <https://www.gnu.org/licenses/>.
- */
 
 namespace Modules\ModuleBitrix24Integration\bin;
 require_once 'Globals.php';
@@ -32,33 +15,25 @@ class UploaderB24 extends WorkerBase
     private Bitrix24Integration $b24;
     private BeanstalkClient $queueAgent;
     private Logger $logger;
-    private const FILE_POLL_INTERVAL = 2;
-    private const FILE_POLL_TIMEOUT  = 180;
+    private const FILE_POLL_INTERVAL = 2;      // секунд между проверками
+    private const MAX_ATTEMPTS = 10;            // максимум попыток
+    private const BASE_DELAY = 5;               // начальная задержка (сек)
+    private const AUTH_RETRY_DELAY = 30;        // задержка при ошибке авторизации
 
-    /**
-     * Pending upload tasks waiting for file to appear on disk.
-     * Each element: ['FILENAME' => ..., 'uploadUrl' => ..., '_receivedAt' => time()]
-     */
-    private array $pendingTasks = [];
-
-    /**
-     * Начало работы демона.
-     *
-     * @param $argv
-     */
-    public function start($argv):void
+    public function start($argv): void
     {
         $this->logger = new Logger('UploaderB24', 'ModuleBitrix24Integration');
         $this->logger->writeInfo('Start daemon...');
 
-        $this->b24    = new Bitrix24Integration('_uploader');
+        $this->b24 = new Bitrix24Integration('_uploader');
         $this->initBeanstalk();
+
         $this->logger->writeInfo('Start waiting...');
         while (!$this->needRestart) {
             try {
                 $this->queueAgent->wait(self::FILE_POLL_INTERVAL);
             } catch (Exception $e) {
-                $this->logger->writeError($e->getLine().';'.$e->getCode().';'.$e->getMessage());
+                $this->logger->writeError($e->getLine() . ';' . $e->getCode() . ';' . $e->getMessage());
                 sleep(1);
                 $this->initBeanstalk();
             }
@@ -66,116 +41,119 @@ class UploaderB24 extends WorkerBase
         }
     }
 
-    /**
-     * Handles the received signal.
-     *
-     * @param int $signal The signal to handle.
-     *
-     * @return void
-     */
-    public function signalHandler(int $signal): void
-    {
-        parent::signalHandler($signal);
-        cli_set_process_title('SHUTDOWN_'.cli_get_process_title());
-        $this->logger->writeInfo("NEED SHUTDOWN ($signal)...");
-
-    }
-
-    /**
-     * Инициализация Beanstalk
-     * @return void
-     */
-    private function initBeanstalk():void
+    private function initBeanstalk(): void
     {
         $this->logger->writeInfo('Init Beanstalk...');
         $this->queueAgent = new BeanstalkClient(self::B24_UPLOADER_CHANNEL);
         $this->queueAgent->subscribe($this->makePingTubeName(self::class), [$this, 'pingCallBack']);
-        $this->queueAgent->subscribe(self::B24_UPLOADER_CHANNEL,  [$this, 'callBack']);
-        $this->queueAgent->setTimeoutHandler([$this, 'executeTasks']);
-    }
-
-    public function executeTasks(): void
-    {
-        if (empty($this->pendingTasks)) {
-            return;
-        }
-        $now = time();
-        $remaining = [];
-        foreach ($this->pendingTasks as $task) {
-            $filename   = $task['FILENAME'] ?? '';
-            $receivedAt = $task['_receivedAt'] ?? $now;
-            $elapsed    = $now - $receivedAt;
-            if ($filename === '') {
-                $this->logger->writeError('Empty filename, skipping task.');
-                continue;
-            }
-            if (!file_exists($filename)) {
-                if ($elapsed >= self::FILE_POLL_TIMEOUT) {
-                    $this->logger->writeError("File '$filename' not found after {$elapsed}s, giving up.");
-                } else {
-                    $remaining[] = $task;
-                }
-                continue;
-            }
-            try {
-                $this->logger->writeInfo("File ready after {$elapsed}s, uploading '$filename'.");
-                $result = $this->b24->uploadRecord($task['uploadUrl'] ?? '', $filename);
-                $errorName = $result['error'] ?? '';
-
-                if (in_array($errorName, ['expired_token', 'wrong_client', 'NO_AUTH_FOUND', 'invalid_token'], true)) {
-                    $this->logger->writeError("Auth error '$errorName' during upload, will retry.");
-                    $this->b24->updateToken();
-                    if ($elapsed < self::FILE_POLL_TIMEOUT) {
-                        $remaining[] = $task;
-                    } else {
-                        $this->logger->writeError("Auth error persists after {$elapsed}s, giving up on '$filename'.");
-                    }
-                    continue;
-                }
-
-                try {
-                    $rawResult = json_encode($result, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
-                    $this->logger->writeInfo('Result: ' . $rawResult);
-                } catch (Exception $e) {
-                    $this->logger->writeError('Exception upload file: ' . $e->getMessage());
-                    continue;
-                }
-                if (!isset($result['result']["FILE_ID"])) {
-                    $this->logger->writeError('Fail upload file. Req: ' . json_encode($result));
-                }
-                usleep(300000);
-            } catch (Exception $e) {
-                $this->logger->writeError($e->getLine().';'.$e->getCode().';'.$e->getMessage());
-            }
-        }
-        $this->pendingTasks = $remaining;
+        $this->queueAgent->subscribe(self::B24_UPLOADER_CHANNEL, [$this, 'processTask']);
+        $this->queueAgent->setTimeoutHandler([$this, 'idleHandler']);
     }
 
     /**
-     * @param BeanstalkClient $client
+     * Обработка задачи из очереди
      */
-    public function callBack(BeanstalkClient $client): void
-    {
-        $stringData = $client->getBody();
-        $this->logger->writeInfo("Queue upload task.");
-        $this->logger->writeInfo("Raw data: $stringData");
-        try {
-            /** @var array $data */
-            $data = json_decode($stringData, true, 512, JSON_THROW_ON_ERROR);
-        }catch (Exception $e){
-            $data = null;
-        }
-        if(!is_array($data)){
-            $this->logger->writeError("Data is not valid JSON.");
+    public function processTask(BeanstalkClient $client): void
+{
+    $raw = $client->getBody();
+    $this->logger->writeInfo("Received task: $raw");
+
+    $task = json_decode($raw, true);
+    if (!is_array($task) || empty($task['uploadUrl']) || empty($task['FILENAME'])) {
+        $this->logger->writeError('Invalid task data');
+        return; // задача будет удалена автоматически
+    }
+
+    $filename   = $task['FILENAME'];
+    $uploadUrl  = $task['uploadUrl'];
+    $attempts   = (int)($task['attempts'] ?? 0);
+    $callId     = $task['CALL_ID'] ?? '';
+
+    // Проверка существования файла
+    if (!file_exists($filename)) {
+        $this->logger->writeError("File not found: $filename");
+        $this->scheduleRetry($client, $task, $attempts + 1, self::BASE_DELAY);
+        return;
+    }
+
+    try {
+        $result = $this->b24->uploadRecord($uploadUrl, $filename);
+        $errorName = $result['error'] ?? '';
+
+        // Ошибки авторизации – обновляем токен и откладываем без увеличения попыток
+        if (in_array($errorName, ['expired_token', 'wrong_client', 'NO_AUTH_FOUND', 'invalid_token'], true)) {
+            $this->logger->writeError("Auth error '$errorName', refreshing token and will retry");
+            $this->b24->updateToken();
+            $this->scheduleRetry($client, $task, $attempts, self::AUTH_RETRY_DELAY);
             return;
         }
-        $data['_receivedAt'] = time();
-        $this->pendingTasks[] = $data;
-        $this->logger->writeInfo('Task queued, polling for file every '.self::FILE_POLL_INTERVAL.'s (max '.self::FILE_POLL_TIMEOUT.'s).');
+
+        // Успех
+        if (isset($result['result']['FILE_ID'])) {
+            $this->logger->writeInfo("Upload successful for $filename");
+            // задача будет удалена автоматически
+            return;
+        }
+
+        // Прочие ошибки API
+        $errorMsg = json_encode($result);
+        $this->logger->writeError("Upload API error: $errorMsg");
+        $this->scheduleRetry($client, $task, $attempts + 1, $this->getDelay($attempts));
+
+    } catch (Exception $e) {
+        $this->logger->writeError("Exception: " . $e->getMessage());
+        $this->scheduleRetry($client, $task, $attempts + 1, $this->getDelay($attempts));
+    }
+}
+
+private function scheduleRetry(BeanstalkClient $client, array $task, int $newAttempts, int $delay): void
+{
+    if ($newAttempts >= self::MAX_ATTEMPTS) {
+        $this->logger->writeError("Task failed after {$newAttempts} attempts: " . json_encode($task));
+        // задача будет удалена автоматически
+        return;
+    }
+
+    $task['attempts'] = $newAttempts;
+    $newBody = json_encode($task);
+    // release задачу с задержкой (в секундах)
+    $client->release($newBody, $delay);
+    $this->logger->writeInfo("Task rescheduled with delay {$delay}s, attempts: {$newAttempts}");
+}
+
+    /**
+     * Экспоненциальная задержка: 2^attempts * BASE_DELAY, но не более 1 часа
+     */
+    private function getDelay(int $attempts): int
+    {
+        $delay = self::BASE_DELAY * pow(2, $attempts);
+        return (int)min($delay, 3600);
+    }
+
+    public function idleHandler(): void
+    {
+        // Ничего не делаем, просто чтобы не было ошибок
+    }
+
+    public function pingCallBack(BeanstalkClient $client): void
+    {
+        if ($this->needRestart) {
+            return;
+        }
+        parent::pingCallBack($client);
+    }
+
+    public function signalHandler(int $signal): void
+    {
+        parent::signalHandler($signal);
+        cli_set_process_title('SHUTDOWN_' . cli_get_process_title());
+        if ($this->logger) {
+            $this->logger->writeInfo("NEED SHUTDOWN ($signal)...");
+        }
     }
 }
 
 // Start worker process
-if(isset($argv) && count($argv) !== 1) {
-    UploaderB24::startWorker($argv??[]);
+if (isset($argv) && count($argv) !== 1) {
+    UploaderB24::startWorker($argv ?? []);
 }

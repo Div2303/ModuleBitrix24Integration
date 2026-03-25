@@ -589,11 +589,8 @@ class WorkerBitrix24IntegrationAMI extends WorkerBase
         $srsUserId = $this->getInnerNum($srcNum);
         $dstUserId = $this->getInnerNum($dstNum);
 
-        if(isset($this->channelCounter[$uniqueId])
-            // Не все каналы с этим ID были завершены.
-            // Вероятно это множественная регистрация.
-            // Либо это CDR по внутреннему вызову.
-            || (!empty($srsUserId) && !empty($dstUserId)) ){
+        // ========== ИЗМЕНЕНИЕ: убрана проверка isset($this->channelCounter[$uniqueId]) ==========
+        if( /*isset($this->channelCounter[$uniqueId]) ||*/ (!empty($srsUserId) && !empty($dstUserId)) ){
             $this->logger->writeInfo("Not all channels with this ID have been completed. This is probably a multiple registration. Or it's CD R on an internal call.. cancellation".$linkedId);
             $needReturn = true;
         }
