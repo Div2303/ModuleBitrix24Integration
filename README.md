@@ -4,7 +4,7 @@
 
 **ModuleBitrix24Integration** — это исправленная и оптимизированная версия модуля интеграции телефонии (MikoPBX) с CRM-системой Битрикс24. 
 
-![Bitrix24 Integration Humor][([[https://ссылка-на-изображение.png](https://github.com/Div2303/ModuleBitrix24Integration/blob/master/1774422688.png)](https://github.com/Div2303/ModuleBitrix24Integration/blob/master/1774422688.png))](https://github.com/Div2303/ModuleBitrix24Integration/blob/master/1774422688.png)
+![Bitrix24 Integration Humor](1774422688.png)
 
 В отличие от оригинальной версии, данный форк полностью устраняет критические логические ошибки и проблемы производительности, обеспечивая стабильную работу синхронизации.
 
